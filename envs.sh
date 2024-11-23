@@ -1,0 +1,3 @@
+export nnUNet_raw_data_base=/data/datasets/nnUNetDG/nnUNet_raw_data_base
+export nnUNet_preprocessed=/data/datasets/nnUNetDG/nnUNet_preprocessed
+export RESULTS_FOLDER=/data/datasets/nnUNetDG/nnUNet_trained_models
