@@ -22,7 +22,7 @@ import copy
 from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
-from nnunet.network_architecture.generic_UNet import Generic_UNet
+from nnunet.network_architecture.unetr import UNETR
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
@@ -37,7 +37,7 @@ from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
 
 
-class nnUNetPretrainTrainerV2(nnUNetTrainer):
+class nnUNETRTrainerV2(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -46,9 +46,8 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                  unpack_data=True, deterministic=True, fp16=False):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
-        # self.max_num_epochs = 1000 1000 for pancreas
-        self.max_num_epochs = 400 # 400 is enough for the training
-        self.initial_lr = 1e-3
+        self.max_num_epochs = 1000
+        self.initial_lr = 1e-4
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
 
@@ -76,19 +75,22 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                 self.load_plans_file()
 
             self.process_plans(self.plans)
+            self.net_num_pool_op_kernel_sizes = [(1, 2, 2), (2, 2, 2),]
 
             self.setup_DA_params()
 
             ################# Here we wrap the loss for deep supervision ############
             # we need to know the number of outputs of the network
-            net_numpool = len(self.net_num_pool_op_kernel_sizes)
+            net_numpool = len(self.net_num_pool_op_kernel_sizes)+1
 
             # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
             # this gives higher resolution outputs more weight in the loss
+            print(net_numpool)
+            # import pdb; pdb.set_trace()
             weights = np.array([1 / (2 ** i) for i in range(net_numpool)])
 
             # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
-            mask = np.array([True] + [True if i < net_numpool - 1 else False for i in range(1, net_numpool)])
+            mask = np.array([True]*net_numpool)
             weights[~mask] = 0
             weights = weights / weights.sum()
             self.ds_loss_weights = weights
@@ -158,29 +160,14 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         dropout_op_kwargs = {'p': 0, 'inplace': True}
         net_nonlin = nn.LeakyReLU
         net_nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
-        self.network = Generic_UNet(self.num_input_channels, self.base_num_features, self.num_classes,
-                                    len(self.net_num_pool_op_kernel_sizes),
-                                    self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
-                                    dropout_op_kwargs,
-                                    net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
-                                    self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
-
-        if "pretrained" in self.plans.keys():
-            ### load the pretrained model
-            print("Loading pretrained model from", self.plans["pretrained"])
-            self.network.load_state_dict(torch.load(self.plans["pretrained"], weights_only=True,
-                                                    map_location=torch.device('cpu')))
-        
+        self.network = UNETR(self.num_input_channels, self.num_classes, _deep_supervision=True, final_nonlin=lambda x: x,)
         if torch.cuda.is_available():
             self.network.cuda()
         self.network.inference_apply_nonlin = softmax_helper
 
     def initialize_optimizer_and_scheduler(self):
         assert self.network is not None, "self.initialize_network must be called first"
-        ### only finetune the last several localization blocks
-        params = list(self.network.seg_outputs.parameters()) + list(self.network.conv_blocks_localization[2:].parameters())
-        self.optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
-                                         momentum=0.99, nesterov=True)
+        self.optimizer = torch.optim.AdamW(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,)
         self.lr_scheduler = None
 
     def run_online_evaluation(self, output, target):
@@ -292,7 +279,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
             if do_backprop:
                 self.amp_grad_scaler.scale(l).backward()
                 self.amp_grad_scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1)
                 self.amp_grad_scaler.step(self.optimizer)
                 self.amp_grad_scaler.update()
         else:
@@ -302,7 +289,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
 
             if do_backprop:
                 l.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1)
                 self.optimizer.step()
 
         if run_online_evaluation:
@@ -326,60 +313,6 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         if self.fold == "all":
             # if fold==all then we use all images for training and validation
             tr_keys = val_keys = list(self.dataset.keys())
-        elif "domain" in str(self.fold):
-            splits_file = join(self.dataset_directory, "splits_domain.pkl")
-
-            # if the split file does not exist we need to create it
-            if not isfile(splits_file):
-                self.print_to_log_file("Creating new standard cross domain with train val test split...")
-                splits = []
-                all_keys_sorted = np.sort(list(self.dataset.keys()))
-                all_domain_list = list(set([i.split("_")[0] for i in all_keys_sorted]))
-                all_domain_list.sort()
-                total_domain_num = len(all_domain_list)
-
-                for i in range(total_domain_num):
-                    test_domain = all_domain_list[i]
-                    if i == 0:
-                        train_domain = all_domain_list[1:]
-                    elif i == total_domain_num - 1:
-                        train_domain = all_domain_list[:-1]
-                    else:
-                        train_domain = all_domain_list[:i] + all_domain_list[i+1:]
-                    train_keys_combined = [j for j in all_keys_sorted if j.split("_")[0] in train_domain]
-                    test_keys = [j for j in all_keys_sorted if j.split("_")[0] == test_domain]
-                    test_keys = np.array(test_keys)
-
-                    ### split the train_keys into train and val
-                    kfold = KFold(n_splits=5, shuffle=True, random_state=12345)
-                    train_idx, val_idx = kfold.split(train_keys_combined).__next__()
-                    train_keys = np.array(train_keys_combined)[train_idx]
-                    val_keys = np.array(train_keys_combined)[val_idx]
-
-                    splits.append(OrderedDict())
-                    splits[-1]['train'] = train_keys
-                    splits[-1]['val'] = val_keys
-                    splits[-1]['test'] = test_keys
-    
-                save_pickle(splits, splits_file)
-
-            else:
-                self.print_to_log_file("Using splits from existing split file:", splits_file)
-                splits = load_pickle(splits_file)
-                self.print_to_log_file("The split file contains %d splits." % len(splits))
-
-            fold_id = int(self.fold.replace("domain", ""))
-            self.print_to_log_file("Desired fold for training: %d" % fold_id)
-            if fold_id < len(splits):
-                tr_keys = splits[fold_id]['train']
-                val_keys = splits[fold_id]['val']
-                test_keys = splits[fold_id]['test']
-                self.print_to_log_file("This split has %d training, %d validation, and %d test cases."
-                                       % (len(tr_keys), len(val_keys), len(test_keys))
-                                       )
-            else:
-                assert fold_id < len(splits), "You requested fold %d but splits file has %d splits" % (fold_id, len(splits))
-    
         else:
             splits_file = join(self.dataset_directory, "splits_final.pkl")
 
@@ -435,28 +368,6 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         for i in test_keys:
             self.dataset_test[i] = self.dataset[i]
     
-    def update_fold(self, fold):
-        """
-        used to swap between folds for inference (ensemble of models from cross-validation)
-        DO NOT USE DURING TRAINING AS THIS WILL NOT UPDATE THE DATASET SPLIT AND THE DATA AUGMENTATION GENERATORS
-        :param fold:
-        :return:
-        """
-        if fold is not None:
-            if fold == "all":
-                if self.output_folder.endswith("%s" % str(self.fold)):
-                    self.output_folder = self.output_folder_base
-                self.output_folder = join(self.output_folder, "%s" % str(fold))
-            elif "domain" in str(fold):
-                if self.output_folder.endswith("fold_%s" % str(self.fold)):
-                    self.output_folder = self.output_folder_base
-                self.output_folder = join(self.output_folder, "%s" % str(fold))
-            else:
-                if self.output_folder.endswith("fold_%s" % str(self.fold)):
-                    self.output_folder = self.output_folder_base
-                self.output_folder = join(self.output_folder, "fold_%s" % str(fold))
-            self.fold = fold
-    
     def get_basic_generators(self):
         self.load_dataset()
         self.do_split()
@@ -487,7 +398,9 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         """
 
         self.deep_supervision_scales = [[1, 1, 1]] + list(list(i) for i in 1 / np.cumprod(
-            np.vstack(self.net_num_pool_op_kernel_sizes), axis=0))[:-1]
+            np.vstack(self.net_num_pool_op_kernel_sizes), axis=0))
+        
+        print(self.deep_supervision_scales)
 
         if self.threeD:
             self.data_aug_params = default_3D_augmentation_params

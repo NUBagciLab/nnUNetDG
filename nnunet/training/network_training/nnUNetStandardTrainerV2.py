@@ -37,7 +37,7 @@ from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
 
 
-class nnUNetPretrainTrainerV2(nnUNetTrainer):
+class nnUNetStandardTrainerV2(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -168,7 +168,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         if "pretrained" in self.plans.keys():
             ### load the pretrained model
             print("Loading pretrained model from", self.plans["pretrained"])
-            self.network.load_state_dict(torch.load(self.plans["pretrained"], weights_only=True,
+            self.network.load_state_dict(torch.load(self.plans["pretrained"],
                                                     map_location=torch.device('cpu')))
         
         if torch.cuda.is_available():
@@ -177,9 +177,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
 
     def initialize_optimizer_and_scheduler(self):
         assert self.network is not None, "self.initialize_network must be called first"
-        ### only finetune the last several localization blocks
-        params = list(self.network.seg_outputs.parameters()) + list(self.network.conv_blocks_localization[2:].parameters())
-        self.optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
+        self.optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                          momentum=0.99, nesterov=True)
         self.lr_scheduler = None
 

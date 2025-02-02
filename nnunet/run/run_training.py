@@ -122,7 +122,7 @@ def main():
         task_id = int(task)
         task = convert_id_to_task_name(task_id)
 
-    if fold == 'all':
+    if fold == 'all' or "domain" in fold:
         pass
     else:
         fold = int(fold)
@@ -164,6 +164,9 @@ def main():
         trainer.save_latest_only = True  # if false it will not store/overwrite _latest but separate files each
 
     trainer.initialize(not validation_only)
+    print("Save is set to: save_intermediate_checkpoints", trainer.save_intermediate_checkpoints)
+    print("Save is set to: save_latest_only", trainer.save_latest_only)
+    print("Save is set to: save_every", trainer.save_every)
 
     if find_lr:
         trainer.find_lr()
@@ -195,6 +198,11 @@ def main():
             trainer.validate(save_softmax=args.npz, validation_folder_name=val_folder,
                             run_postprocessing_on_folds=not disable_postprocessing_on_folds,
                             overwrite=args.val_disable_overwrite)
+            ### check if validate_test in trainer as method
+            if hasattr(trainer, 'validate_test'):
+                trainer.validate_test(save_softmax=args.npz,
+                                      run_postprocessing_on_folds=not disable_postprocessing_on_folds,
+                                      overwrite=args.val_disable_overwrite)
 
         if network == '3d_lowres' and not args.disable_next_stage_pred:
             print("predicting segmentations for the next stage of the cascade")

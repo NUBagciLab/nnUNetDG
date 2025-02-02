@@ -37,7 +37,7 @@ from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
 
 
-class nnUNetPretrainTrainerV2(nnUNetTrainer):
+class nnUNetInterevalTrainerV2(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -48,7 +48,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                          deterministic, fp16)
         # self.max_num_epochs = 1000 1000 for pancreas
         self.max_num_epochs = 400 # 400 is enough for the training
-        self.initial_lr = 1e-3
+        self.initial_lr = 1e-2
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
 
@@ -164,22 +164,13 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                                     dropout_op_kwargs,
                                     net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
                                     self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
-
-        if "pretrained" in self.plans.keys():
-            ### load the pretrained model
-            print("Loading pretrained model from", self.plans["pretrained"])
-            self.network.load_state_dict(torch.load(self.plans["pretrained"], weights_only=True,
-                                                    map_location=torch.device('cpu')))
-        
         if torch.cuda.is_available():
             self.network.cuda()
         self.network.inference_apply_nonlin = softmax_helper
 
     def initialize_optimizer_and_scheduler(self):
         assert self.network is not None, "self.initialize_network must be called first"
-        ### only finetune the last several localization blocks
-        params = list(self.network.seg_outputs.parameters()) + list(self.network.conv_blocks_localization[2:].parameters())
-        self.optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
+        self.optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                          momentum=0.99, nesterov=True)
         self.lr_scheduler = None
 
@@ -326,7 +317,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         if self.fold == "all":
             # if fold==all then we use all images for training and validation
             tr_keys = val_keys = list(self.dataset.keys())
-        elif "domain" in str(self.fold):
+        elif "domain" in self.fold:
             splits_file = join(self.dataset_directory, "splits_domain.pkl")
 
             # if the split file does not exist we need to create it
@@ -372,7 +363,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
             self.print_to_log_file("Desired fold for training: %d" % fold_id)
             if fold_id < len(splits):
                 tr_keys = splits[fold_id]['train']
-                val_keys = splits[fold_id]['val']
+                val_keys = splits[fold_id]['test']
                 test_keys = splits[fold_id]['test']
                 self.print_to_log_file("This split has %d training, %d validation, and %d test cases."
                                        % (len(tr_keys), len(val_keys), len(test_keys))
@@ -447,7 +438,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                 if self.output_folder.endswith("%s" % str(self.fold)):
                     self.output_folder = self.output_folder_base
                 self.output_folder = join(self.output_folder, "%s" % str(fold))
-            elif "domain" in str(fold):
+            elif "domain" in fold:
                 if self.output_folder.endswith("fold_%s" % str(self.fold)):
                     self.output_folder = self.output_folder_base
                 self.output_folder = join(self.output_folder, "%s" % str(fold))

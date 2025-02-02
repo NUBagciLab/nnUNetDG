@@ -19,10 +19,12 @@ from typing import Tuple
 import numpy as np
 import torch
 import copy
+import random
+import nnunet
 from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
-from nnunet.network_architecture.generic_UNet import Generic_UNet
+from nnunet.network_architecture.generic_PromptUNet import Generic_PromptUNet
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
@@ -37,7 +39,7 @@ from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
 
 
-class nnUNetPretrainTrainerV2(nnUNetTrainer):
+class nnUNetPromptTrainerV2(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -46,9 +48,9 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                  unpack_data=True, deterministic=True, fp16=False):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
-        # self.max_num_epochs = 1000 1000 for pancreas
-        self.max_num_epochs = 400 # 400 is enough for the training
-        self.initial_lr = 1e-3
+        self.max_num_epochs = 200
+        # self.initial_lr = 1e-2
+        self.initial_lr = 1e-2
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
 
@@ -158,19 +160,26 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         dropout_op_kwargs = {'p': 0, 'inplace': True}
         net_nonlin = nn.LeakyReLU
         net_nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
-        self.network = Generic_UNet(self.num_input_channels, self.base_num_features, self.num_classes,
+        text_embedding = None
+        if "text_embedding" in self.plans.keys():
+            text_embedding_dict = pickle.load(open(self.plans["text_embedding"], 'rb'))
+            organ_name = self.plans["organ_name"]
+            print("Using text embedding for organ", organ_name)
+            text_embedding = text_embedding_dict[organ_name]
+
+        self.network = Generic_PromptUNet(self.num_input_channels, self.base_num_features, self.num_classes,
                                     len(self.net_num_pool_op_kernel_sizes),
                                     self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
                                     dropout_op_kwargs,
                                     net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
-                                    self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
-
+                                    self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True,
+                                    transformer_dim=768,embedding_nums=3,text_embedding=text_embedding)
         if "pretrained" in self.plans.keys():
             ### load the pretrained model
             print("Loading pretrained model from", self.plans["pretrained"])
             self.network.load_state_dict(torch.load(self.plans["pretrained"], weights_only=True,
-                                                    map_location=torch.device('cpu')))
-        
+                                                    map_location=torch.device('cpu')), strict=False)
+
         if torch.cuda.is_available():
             self.network.cuda()
         self.network.inference_apply_nonlin = softmax_helper
@@ -178,10 +187,50 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
     def initialize_optimizer_and_scheduler(self):
         assert self.network is not None, "self.initialize_network must be called first"
         ### only finetune the last several localization blocks
-        params = list(self.network.seg_outputs.parameters()) + list(self.network.conv_blocks_localization[2:].parameters())
-        self.optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
-                                         momentum=0.99, nesterov=True)
+        # params = list(self.network.seg_outputs.parameters()) + list(self.network.conv_blocks_localization[2:].parameters())
+        # params = self.network.parameters()
+        ### for prompts-tuning
+        # params = [self.network.mask_tokens.weight,
+        #           self.network.text_embedding] + list(self.network.seg_outputs.parameters())
+
+        ### for prompts-decoder
+        # params = [self.network.mask_tokens.weight,
+        #          self.network.text_embedding] + list(self.network.seg_outputs.parameters()) + list(self.network.tu[2:].parameters())
+        
+        ### load the pretrained model
+        bottom_level = self.plans["finetune_block"]
+        params = [self.network.mask_tokens.weight, self.network.text_embedding] + list(self.network.seg_outputs.parameters()) + \
+            list(self.network.tu[2:].parameters()) + list(self.network.conv_blocks_localization[:bottom_level].parameters())
+        
+        # self.optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
+        #                                  momentum=0.99, nesterov=True)
+        self.optimizer = torch.optim.AdamW(params, self.initial_lr,
+                                           weight_decay=self.weight_decay)
         self.lr_scheduler = None
+
+    def preprocess_patient(self, input_files, seg_file=None,):
+       
+        from nnunet.training.model_restore import recursive_find_python_class
+        preprocessor_name = self.plans.get('preprocessor_name')
+        if preprocessor_name is None:
+            if self.threeD:
+                preprocessor_name = "GenericPreprocessor"
+            else:
+                preprocessor_name = "PreprocessorFor2D"
+
+        print("using preprocessor", preprocessor_name)
+        preprocessor_class = recursive_find_python_class([join(nnunet.__path__[0], "preprocessing")],
+                                                         preprocessor_name,
+                                                         current_module="nnunet.preprocessing")
+        assert preprocessor_class is not None, "Could not find preprocessor %s in nnunet.preprocessing" % \
+                                               preprocessor_name
+        preprocessor = preprocessor_class(self.normalization_schemes, self.use_mask_for_norm,
+                                          self.transpose_forward, self.intensity_properties)
+
+        d, s, properties = preprocessor.preprocess_test_case(input_files,
+                                                             self.plans['plans_per_stage'][self.stage][
+                                                                 'current_spacing'], seg_file)
+        return d, s, properties
 
     def run_online_evaluation(self, output, target):
         """
@@ -260,57 +309,6 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                                                                        mixed_precision=mixed_precision)
         self.network.do_ds = ds
         return ret
-
-    def run_iteration(self, data_generator, do_backprop=True, run_online_evaluation=False):
-        """
-        gradient clipping improves training stability
-
-        :param data_generator:
-        :param do_backprop:
-        :param run_online_evaluation:
-        :return:
-        """
-        data_dict = next(data_generator)
-        data = data_dict['data']
-        target = data_dict['target']
-
-        data = maybe_to_torch(data)
-        target = maybe_to_torch(target)
-
-        if torch.cuda.is_available():
-            data = to_cuda(data)
-            target = to_cuda(target)
-
-        self.optimizer.zero_grad()
-
-        if self.fp16:
-            with autocast():
-                output = self.network(data)
-                del data
-                l = self.loss(output, target)
-
-            if do_backprop:
-                self.amp_grad_scaler.scale(l).backward()
-                self.amp_grad_scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.amp_grad_scaler.step(self.optimizer)
-                self.amp_grad_scaler.update()
-        else:
-            output = self.network(data)
-            del data
-            l = self.loss(output, target)
-
-            if do_backprop:
-                l.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.optimizer.step()
-
-        if run_online_evaluation:
-            self.run_online_evaluation(output, target)
-
-        del target
-
-        return l.detach().cpu().numpy()
 
     def do_split(self):
         """
@@ -581,3 +579,227 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         ret = super().run_training()
         self.network.do_ds = ds
         return ret
+
+    def run_iteration(self, data_generator, do_backprop=True, run_online_evaluation=False):
+        data_dict = next(data_generator)
+        data = data_dict['data']
+        target = data_dict['target']
+
+        data = maybe_to_torch(data)
+        target = maybe_to_torch(target)
+
+        #### build bbox and points prompts
+        iter_points, iter_bboxes = self.build_prompt_label(target[0][:, 0])
+        # import pdb; pdb.set_trace()
+        prompt_options = [[None, None], [iter_points, None],
+                          [None, iter_bboxes], [iter_points, iter_bboxes]]
+
+        if torch.cuda.is_available():
+            data = to_cuda(data)
+            target = to_cuda(target)
+
+        if self.fp16:
+            raise NotImplementedError("fp16 not implemented")
+        self.optimizer.zero_grad()
+
+        if do_backprop:
+            for prompt in prompt_options:
+                self.optimizer.zero_grad()
+                output = self.network(data, prompt[0], prompt[1])
+                l = self.loss(output, target)
+                l.backward()
+                self.optimizer.step()
+
+        if run_online_evaluation:
+            output = self.network(data, iter_points, iter_bboxes)
+            l = self.loss(output, target)
+            self.run_online_evaluation(output, target)
+
+        del target, data
+
+        return l.detach().cpu().numpy()
+    
+    def build_prompt_label(self, train_labels):
+        bs = train_labels.shape[0]
+        # generate prompt & label
+        iter_bboxes = []
+        iter_points_ax = []
+        iter_point_labels = []
+        for sample_idx in range(bs):
+            # box prompt
+            box = generate_box(train_labels[sample_idx])
+            iter_bboxes.append(box)
+            # point prompt
+            num_positive_extra_max, num_negative_extra_max = 10, 10
+            num_positive_extra = random.randint(0, num_positive_extra_max)
+            num_negative_extra = random.randint(0, num_negative_extra_max)
+            point, point_label = select_points(
+                train_labels[sample_idx],
+                num_positive_extra=num_positive_extra,
+                num_negative_extra=num_negative_extra,
+                fix_extra_point_num=num_positive_extra_max + num_negative_extra_max)
+            iter_points_ax.append(point)
+            iter_point_labels.append(point_label)
+        # batched prompt
+        iter_points_ax = torch.stack(iter_points_ax, dim=0).cuda()
+        iter_point_labels = torch.stack(iter_point_labels, dim=0).cuda()
+        iter_points = (iter_points_ax, iter_point_labels)
+        iter_bboxes = torch.stack(iter_bboxes, dim=0).float().cuda()
+        return iter_points, iter_bboxes
+    
+    def predict_with_prompt(self, data, points=None, boxes=None,):
+        self.network.eval()
+        self.network.do_ds = False
+        with torch.no_grad():
+            data = maybe_to_torch(data)
+            if torch.cuda.is_available():
+                data = to_cuda(data)
+            output = self.network(data, points, boxes)
+        
+        # output = torch.argmax(output, dim=1, keepdim=False).squeeze(dim=0)
+        output = output.squeeze(dim=0).detach().cpu().numpy()
+        return output
+    
+    def predict_preprocessed_data_return_seg_and_softmax_withbox_points(self, data: np.ndarray, bbox=None, points=None,
+                                                                        do_mirroring: bool = True,
+                                                                        mirror_axes: Tuple[int] = None,
+                                                                        use_sliding_window: bool = True, step_size: float = 0.5,
+                                                                        use_gaussian: bool = True, pad_border_mode: str = 'constant',
+                                                                        pad_kwargs: dict = None, all_in_gpu: bool = False,
+                                                                        verbose: bool = True, mixed_precision: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        :param data:
+        :param do_mirroring:
+        :param mirror_axes:
+        :param use_sliding_window:
+        :param step_size:
+        :param use_gaussian:
+        :param pad_border_mode:
+        :param pad_kwargs:
+        :param all_in_gpu:
+        :param verbose:
+        :return:
+        """
+        if pad_border_mode == 'constant' and pad_kwargs is None:
+            pad_kwargs = {'constant_values': 0}
+
+        if do_mirroring and mirror_axes is None:
+            mirror_axes = self.data_aug_params['mirror_axes']
+
+        if do_mirroring:
+            assert self.data_aug_params["do_mirror"], "Cannot do mirroring as test time augmentation when training " \
+                                                      "was done without mirroring"
+
+        valid = list((SegmentationNetwork, nn.DataParallel))
+        assert isinstance(self.network, tuple(valid))
+
+        current_mode = self.network.training
+        do_ds = self.network.do_ds
+        self.network.do_ds = False
+        self.network.eval()
+        ret = self.network.predict_3D_bbox_points(data, bbox, points, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
+                                                  use_sliding_window=use_sliding_window, step_size=step_size,
+                                                  patch_size=self.patch_size, regions_class_order=self.regions_class_order,
+                                                  use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
+                                                  pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu, verbose=verbose,
+                                                  mixed_precision=mixed_precision)
+        self.network.train(current_mode)
+        self.network.do_ds = do_ds
+        return ret
+
+
+def generate_box(pred_pre, bbox_shift=None):
+    meaning_post_label = pred_pre # [h, w, d]
+    ones_idx = (meaning_post_label > 0).nonzero(as_tuple=True)
+    if all(tensor.nelement() == 0 for tensor in ones_idx):
+        bboxes = torch.tensor([-1,-1,-1,-1,-1,-1])
+        # print(bboxes, bboxes.shape)
+        return bboxes
+    min_coords = [dim.min() for dim in ones_idx]    # [x_min, y_min, z_min]
+    max_coords = [dim.max() for dim in ones_idx]    # [x_max, y_max, z_max]
+
+    if bbox_shift is None:
+        corner_min = []
+        corner_max = []
+        shape = meaning_post_label.shape
+        for coor in min_coords:
+            coor_ = max(0, coor)
+            corner_min.append(coor_)
+        for idx, coor in enumerate(max_coords):
+            coor_ = min(shape[idx], coor)
+            corner_max.append(coor_)
+        corner_min = torch.tensor(corner_min)
+        corner_max = torch.tensor(corner_max)
+        return torch.cat((corner_min, corner_max), dim=0)
+    else:
+        # add perturbation to bounding box coordinates
+        corner_min = []
+        corner_max = []
+        shape = meaning_post_label.shape
+        for coor in min_coords:
+            coor_ = max(0, coor + random.randint(-bbox_shift, bbox_shift))
+            corner_min.append(coor_)
+        for idx, coor in enumerate(max_coords):
+            coor_ = min(shape[idx], coor + random.randint(-bbox_shift, bbox_shift))
+            corner_max.append(coor_)
+        corner_min = torch.tensor(corner_min)
+        corner_max = torch.tensor(corner_max)
+        return torch.cat((corner_min, corner_max), dim=0)
+
+
+def select_points(preds, num_positive_extra=4, num_negative_extra=0, fix_extra_point_num=None):
+    spacial_dim = 3
+    points = torch.zeros((0, 3))
+    labels = torch.zeros((0))
+    pos_thred = 0.9
+    neg_thred = 0.1
+    
+    # get pos/net indices
+    positive_indices = torch.nonzero(preds > pos_thred, as_tuple=True) # ([pos x], [pos y], [pos z])
+    negative_indices = torch.nonzero(preds < neg_thred, as_tuple=True)
+
+    ones_idx = (preds > pos_thred).nonzero(as_tuple=True)
+    if all(tmp.nelement() == 0 for tmp in ones_idx):
+        # all neg
+        num_positive_extra = 0
+        selected_positive_point = torch.tensor([-1,-1,-1]).unsqueeze(dim=0)
+        points = torch.cat((points, selected_positive_point), dim=0)
+        labels = torch.cat((labels, torch.tensor([-1]).reshape(1)))
+    else:
+        # random select a pos point
+        random_idx = torch.randint(len(positive_indices[0]), (1,))
+        selected_positive_point = torch.tensor([positive_indices[i][random_idx] for i in range(spacial_dim)]).unsqueeze(dim=0)
+        points = torch.cat((points, selected_positive_point), dim=0)
+        labels = torch.cat((labels, torch.ones((1))))
+
+    if num_positive_extra > 0:
+        pos_idx_list = torch.randperm(len(positive_indices[0]))[:num_positive_extra]
+        extra_positive_points = []
+        for pos_idx in pos_idx_list:
+            extra_positive_points.append([positive_indices[i][pos_idx] for i in range(spacial_dim)])
+        extra_positive_points = torch.tensor(extra_positive_points).reshape(-1, 3)
+        points = torch.cat((points, extra_positive_points), dim=0)
+        labels = torch.cat((labels, torch.ones((extra_positive_points.shape[0]))))
+
+    if num_negative_extra > 0:
+        neg_idx_list = torch.randperm(len(negative_indices[0]))[:num_negative_extra]
+        extra_negative_points = []
+        for neg_idx in neg_idx_list:
+            extra_negative_points.append([negative_indices[i][neg_idx] for i in range(spacial_dim)])
+        extra_negative_points = torch.tensor(extra_negative_points).reshape(-1, 3)
+        points = torch.cat((points, extra_negative_points), dim=0)
+        labels = torch.cat((labels, torch.zeros((extra_negative_points.shape[0]))))
+        # print('extra_negative_points ', extra_negative_points, extra_negative_points.shape)
+        # print('==> points ', points.shape, labels)
+    
+    if fix_extra_point_num is None:
+        left_point_num = num_positive_extra + num_negative_extra + 1 - labels.shape[0]
+    else:
+        left_point_num = fix_extra_point_num  + 1 - labels.shape[0]
+
+    for _ in range(left_point_num):
+        ignore_point = torch.tensor([-1,-1,-1]).unsqueeze(dim=0)
+        points = torch.cat((points, ignore_point), dim=0)
+        labels = torch.cat((labels, torch.tensor([-1]).reshape(1)))
+
+    return (points, labels)

@@ -19,7 +19,7 @@ from typing import Tuple
 import numpy as np
 import torch
 import copy
-from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation
+from nnunet.training.data_augmentation.data_augmentation_insaneDA2 import get_insaneDA_augmentation2
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
 from nnunet.network_architecture.generic_UNet import Generic_UNet
@@ -36,8 +36,18 @@ from torch.cuda.amp import autocast
 from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
 
+### update the default data augmentation parameters for big augmentations
+default_3D_augmentation_params['rotation_x'] = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
+default_3D_augmentation_params['rotation_y'] = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
+default_3D_augmentation_params['rotation_z'] = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
+default_3D_augmentation_params['p_rot'] = 0.5
+default_3D_augmentation_params['scale_range'] = (0.4, 1.6)
+default_3D_augmentation_params['p_scale'] = 0.5
+default_3D_augmentation_params['gamma_range'] = (0.5, 4.5)
+default_3D_augmentation_params['p_gamma'] = 0.5
 
-class nnUNetPretrainTrainerV2(nnUNetTrainer):
+
+class nnUNetBigAugTrainerV2(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -47,8 +57,8 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
         # self.max_num_epochs = 1000 1000 for pancreas
-        self.max_num_epochs = 400 # 400 is enough for the training
-        self.initial_lr = 1e-3
+        self.max_num_epochs = 100 # 400 is enough for the training
+        self.initial_lr = 1e-2
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
 
@@ -109,14 +119,13 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                         "INFO: Not unpacking data! Training may be slow due to that. Pray you are not using 2d or you "
                         "will wait all winter for your model to finish!")
 
-                self.tr_gen, self.val_gen = get_moreDA_augmentation(
+                self.tr_gen, self.val_gen = get_insaneDA_augmentation2(
                     self.dl_tr, self.dl_val,
                     self.data_aug_params[
                         'patch_size_for_spatialtransform'],
                     self.data_aug_params,
                     deep_supervision_scales=self.deep_supervision_scales,
                     pin_memory=self.pin_memory,
-                    use_nondetMultiThreadedAugmenter=False
                 )
                 self.print_to_log_file("TRAINING KEYS:\n %s" % (str(self.dataset_tr.keys())),
                                        also_print_to_console=False)
@@ -165,21 +174,13 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
                                     net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
                                     self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
 
-        if "pretrained" in self.plans.keys():
-            ### load the pretrained model
-            print("Loading pretrained model from", self.plans["pretrained"])
-            self.network.load_state_dict(torch.load(self.plans["pretrained"], weights_only=True,
-                                                    map_location=torch.device('cpu')))
-        
         if torch.cuda.is_available():
             self.network.cuda()
         self.network.inference_apply_nonlin = softmax_helper
 
     def initialize_optimizer_and_scheduler(self):
         assert self.network is not None, "self.initialize_network must be called first"
-        ### only finetune the last several localization blocks
-        params = list(self.network.seg_outputs.parameters()) + list(self.network.conv_blocks_localization[2:].parameters())
-        self.optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
+        self.optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                          momentum=0.99, nesterov=True)
         self.lr_scheduler = None
 
@@ -491,9 +492,6 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
 
         if self.threeD:
             self.data_aug_params = default_3D_augmentation_params
-            self.data_aug_params['rotation_x'] = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
-            self.data_aug_params['rotation_y'] = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
-            self.data_aug_params['rotation_z'] = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
             if self.do_dummy_2D_aug:
                 self.data_aug_params["dummy_2D"] = True
                 self.print_to_log_file("Using dummy2d data augmentation")

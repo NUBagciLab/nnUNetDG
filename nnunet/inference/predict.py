@@ -190,7 +190,7 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
     print("loading parameters for folds,", folds)
     trainer, params = load_model_and_checkpoint_files(model, folds, mixed_precision=mixed_precision,
                                                       checkpoint_name=checkpoint_name)
-
+    trainer.initialize(False)
     if segmentation_export_kwargs is None:
         if 'segmentation_export_params' in trainer.plans.keys():
             force_separate_z = trainer.plans['segmentation_export_params']['force_separate_z']
@@ -240,6 +240,20 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
             transpose_backward = trainer.plans.get('transpose_backward')
             softmax = softmax.transpose([0] + [i + 1 for i in transpose_backward])
 
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        # import pdb; pdb.set_trace()
+        max_slice = np.argmax(np.sum(softmax[1]>0.5, axis=(1, 2)))
+        plt.figure()
+        plt.subplot(1, 2, 1)
+        plt.imshow(d[0, max_slice], cmap='gray')
+        plt.subplot(1, 2, 2)
+        plt.imshow(softmax[1, max_slice], cmap='gray')
+        ### show the bbox of the segmentation
+        plt.savefig(os.path.join("/home/zze3980/projects/medpretrain/nnUNetDG/temp_logs",
+                                 output_filename.split("/")[-1][:-7] + "_max_slice.png"))
+        """
         if save_npz:
             npz_file = output_filename[:-7] + ".npz"
         else:

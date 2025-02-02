@@ -37,7 +37,108 @@ from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
 
 
-class nnUNetPretrainTrainerV2(nnUNetTrainer):
+class RandConv(nn.Module):
+    """Random Convolution Based input augmentation
+    https://arxiv.org/abs/2007.13003
+
+    args:
+        input_channel:int
+        output_channel:int
+        prob: float, the possibility for random conv, default 0.5
+        n_dim: convolution dimension
+        kernel_size: kernel size for convolution
+        distribution: the distribution for random initialization
+                      supports: kaiming_normal, kaiming_uniform, xavier_normal
+    """
+    def __init__(self, input_channel:int, output_channel:int, prob:float=0.5,
+                       n_dim:int=2, kernel_size_list:list=[1, 3, 5, 7], distribution='kaiming_normal'):
+        super().__init__()
+        self.input_channel = input_channel
+        self.output_channel = output_channel
+        self.n_dim = n_dim
+        self.prob = prob
+        self.kernel_size_list = kernel_size_list
+        self.distribution = distribution
+        
+        # self.register_buffer("rand_conv", self.conv)
+        self.random_func = self.get_random()
+        self.reset_conv()
+
+    @torch.no_grad()
+    def forward(self, input):
+
+        self.reset_conv()
+        self.conv.to(input.device)
+        return self.conv(input)
+
+    def get_random(self):
+        if self.distribution == 'kaiming_uniform':
+            random_func = nn.init.kaiming_uniform_
+        elif self.distribution == 'kaiming_normal':
+            random_func = nn.init.kaiming_normal_
+        elif self.distribution == 'xavier_normal':
+            random_func = nn.init.xavier_normal_
+        else:
+            raise NotImplementedError("Initialization method not support")
+        return random_func
+
+    def reset_conv(self):
+        kernel_size = np.random.choice(self.kernel_size_list)
+        if self.n_dim == 2:
+            self.conv = nn.Conv2d(in_channels=self.input_channel, out_channels=self.output_channel,
+                                  kernel_size=kernel_size, bias=False, padding=kernel_size//2)
+        elif self.n_dim == 3:
+            self.conv = nn.Conv3d(in_channels=self.input_channel, out_channels=self.output_channel,
+                                  kernel_size=kernel_size, bias=False, padding=kernel_size//2)
+        else:
+            raise NameError(f"Random Conv {self.n_dim} Not implement now")
+        self.random_func(self.conv.weight)
+
+
+class Generic_RandConvUNet(Generic_UNet):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        randconv_inchannel = self.conv_blocks_context[0].input_channels
+        randconv_outchannel = self.conv_blocks_context[0].output_channels
+        self.rand_conv = RandConv(input_channel=randconv_inchannel,
+                                  output_channel=randconv_outchannel,
+                                  prob=0.5, n_dim=3, kernel_size_list=[1, 3, 5, 7],
+                                  distribution='kaiming_normal')
+    
+    def forward(self, x):
+        skips = []
+        seg_outputs = []
+        for d in range(len(self.conv_blocks_context) - 1):
+            if d == 0 and np.random.random() < self.rand_conv.prob and self.training:
+                x = self.rand_conv(x) + self.conv_blocks_context[d](x)
+            else:
+                x = self.conv_blocks_context[d](x)
+            skips.append(x)
+            if not self.convolutional_pooling:
+                x = self.td[d](x)
+
+        x = self.conv_blocks_context[-1](x)
+
+        for u in range(len(self.tu)):
+            x = self.tu[u](x)
+            x = torch.cat((x, skips[-(u + 1)]), dim=1)
+            x = self.conv_blocks_localization[u](x)
+            seg_outputs.append(self.final_nonlin(self.seg_outputs[u](x)))
+
+        if self._deep_supervision and self.do_ds:
+            return tuple([seg_outputs[-1]] + [i(j) for i, j in
+                                              zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])])
+        else:
+            return seg_outputs[-1]
+    
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        ### ignore the random conv layer
+        state_dict.pop("rand_conv.conv.weight")
+        print("Ignore the random conv layer")
+        return super().load_state_dict(state_dict, False, assign)
+
+
+class nnUNetRandConvTrainerV2(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -47,8 +148,8 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
         # self.max_num_epochs = 1000 1000 for pancreas
-        self.max_num_epochs = 400 # 400 is enough for the training
-        self.initial_lr = 1e-3
+        self.max_num_epochs = 100 # 400 is enough for the training
+        self.initial_lr = 1e-2
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
 
@@ -158,18 +259,12 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         dropout_op_kwargs = {'p': 0, 'inplace': True}
         net_nonlin = nn.LeakyReLU
         net_nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
-        self.network = Generic_UNet(self.num_input_channels, self.base_num_features, self.num_classes,
+        self.network = Generic_RandConvUNet(self.num_input_channels, self.base_num_features, self.num_classes,
                                     len(self.net_num_pool_op_kernel_sizes),
                                     self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
                                     dropout_op_kwargs,
                                     net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
                                     self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
-
-        if "pretrained" in self.plans.keys():
-            ### load the pretrained model
-            print("Loading pretrained model from", self.plans["pretrained"])
-            self.network.load_state_dict(torch.load(self.plans["pretrained"], weights_only=True,
-                                                    map_location=torch.device('cpu')))
         
         if torch.cuda.is_available():
             self.network.cuda()
@@ -177,9 +272,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
 
     def initialize_optimizer_and_scheduler(self):
         assert self.network is not None, "self.initialize_network must be called first"
-        ### only finetune the last several localization blocks
-        params = list(self.network.seg_outputs.parameters()) + list(self.network.conv_blocks_localization[2:].parameters())
-        self.optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
+        self.optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                          momentum=0.99, nesterov=True)
         self.lr_scheduler = None
 

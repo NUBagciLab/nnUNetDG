@@ -36,8 +36,43 @@ from torch.cuda.amp import autocast
 from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
 
+class Generic_EDUNet(Generic_UNet):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-class nnUNetPretrainTrainerV2(nnUNetTrainer):
+    def forward(self, x):
+        return super().forward(x)
+    
+    def encoder(self, x):
+        skips = []
+        for d in range(len(self.conv_blocks_context) - 1):
+            x = self.conv_blocks_context[d](x)
+            skips.append(x)
+            if not self.convolutional_pooling:
+                x = self.td[d](x)
+
+        x = self.conv_blocks_context[-1](x)
+
+        skips.append(x)
+        return skips
+
+    def decoder(self, skips):
+        seg_outputs = []
+        skips, x = skips[:-1], skips[-1]
+        for u in range(len(self.tu)):
+            x = self.tu[u](x)
+            x = torch.cat((x, skips[-(u + 1)]), dim=1)
+            x = self.conv_blocks_localization[u](x)
+            seg_outputs.append(self.final_nonlin(self.seg_outputs[u](x)))
+
+        if self._deep_supervision and self.do_ds:
+            return tuple([seg_outputs[-1]] + [i(j) for i, j in
+                                              zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])])
+        else:
+            return seg_outputs[-1]
+
+
+class nnUNetRSCTrainerV2(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -158,17 +193,17 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         dropout_op_kwargs = {'p': 0, 'inplace': True}
         net_nonlin = nn.LeakyReLU
         net_nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
-        self.network = Generic_UNet(self.num_input_channels, self.base_num_features, self.num_classes,
-                                    len(self.net_num_pool_op_kernel_sizes),
-                                    self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
-                                    dropout_op_kwargs,
-                                    net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
-                                    self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
+        self.network = Generic_EDUNet(self.num_input_channels, self.base_num_features, self.num_classes,
+                                      len(self.net_num_pool_op_kernel_sizes),
+                                      self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
+                                      dropout_op_kwargs,
+                                      net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
+                                      self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
 
         if "pretrained" in self.plans.keys():
             ### load the pretrained model
             print("Loading pretrained model from", self.plans["pretrained"])
-            self.network.load_state_dict(torch.load(self.plans["pretrained"], weights_only=True,
+            self.network.load_state_dict(torch.load(self.plans["pretrained"],
                                                     map_location=torch.device('cpu')))
         
         if torch.cuda.is_available():
@@ -177,9 +212,7 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
 
     def initialize_optimizer_and_scheduler(self):
         assert self.network is not None, "self.initialize_network must be called first"
-        ### only finetune the last several localization blocks
-        params = list(self.network.seg_outputs.parameters()) + list(self.network.conv_blocks_localization[2:].parameters())
-        self.optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
+        self.optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                          momentum=0.99, nesterov=True)
         self.lr_scheduler = None
 
@@ -284,26 +317,24 @@ class nnUNetPretrainTrainerV2(nnUNetTrainer):
         self.optimizer.zero_grad()
 
         if self.fp16:
-            with autocast():
-                output = self.network(data)
-                del data
-                l = self.loss(output, target)
+            raise NotImplementedError("fp16 not implemented for this trainer")
+        
+        features = self.network.encoder(data)
+        features = self.rsc.wrap_variable(features)
+        output = self.network.decoder(features)
 
-            if do_backprop:
-                self.amp_grad_scaler.scale(l).backward()
-                self.amp_grad_scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.amp_grad_scaler.step(self.optimizer)
-                self.amp_grad_scaler.update()
-        else:
-            output = self.network(data)
-            del data
-            l = self.loss(output, target)
+        l = self.loss(output, target)
+        l.backward()
+        feature_masks = self.rsc.generate_mask(features)
+        
+        output = self.network(data)
+        del data
+        l = self.loss(output, target)
 
-            if do_backprop:
-                l.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.optimizer.step()
+        if do_backprop:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
 
         if run_online_evaluation:
             self.run_online_evaluation(output, target)

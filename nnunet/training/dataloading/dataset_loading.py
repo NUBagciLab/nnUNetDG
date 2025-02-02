@@ -19,6 +19,7 @@ from multiprocessing import Pool
 from batchgenerators.dataloading.data_loader import SlimDataLoaderBase
 
 from nnunet.configuration import default_num_threads
+default_num_threads = 2
 from nnunet.paths import preprocessing_output_dir
 from batchgenerators.utilities.file_and_folder_operations import *
 
@@ -319,9 +320,12 @@ class DataLoader3D(SlimDataLoaderBase):
                     selected_voxel = voxels_of_that_class[np.random.choice(len(voxels_of_that_class))]
                     # selected voxel is center voxel. Subtract half the patch size to get lower bbox voxel.
                     # Make sure it is within the bounds of lb and ub
-                    bbox_x_lb = max(lb_x, selected_voxel[0] - self.patch_size[0] // 2)
-                    bbox_y_lb = max(lb_y, selected_voxel[1] - self.patch_size[1] // 2)
-                    bbox_z_lb = max(lb_z, selected_voxel[2] - self.patch_size[2] // 2)
+                    # bbox_x_lb = max(lb_x, selected_voxel[0] - self.patch_size[0] // 2)
+                    # bbox_y_lb = max(lb_y, selected_voxel[1] - self.patch_size[1] // 2)
+                    # bbox_z_lb = max(lb_z, selected_voxel[2] - self.patch_size[2] // 2)
+                    bbox_x_lb = max(lb_x, selected_voxel[0] - np.random.randint(0, self.patch_size[0]))
+                    bbox_y_lb = max(lb_y, selected_voxel[1] - np.random.randint(0, self.patch_size[1]))
+                    bbox_z_lb = max(lb_z, selected_voxel[2] - np.random.randint(0, self.patch_size[2]))
                 else:
                     # If the image does not contain any foreground classes, we fall back to random cropping
                     bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
