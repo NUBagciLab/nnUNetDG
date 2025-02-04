@@ -35,19 +35,13 @@ class Evaluator:
     """
 
     default_metrics = [
-        "False Positive Rate",
         "Dice",
         "Jaccard",
         "Precision",
         "Recall",
         "Accuracy",
-        "False Omission Rate",
-        "Negative Predictive Value",
-        "False Negative Rate",
-        "True Negative Rate",
-        "False Discovery Rate",
-        "Total Positives Test",
-        "Total Positives Reference"
+        "Hausdorff Distance 95",
+        "Avg. Symmetric Surface Distance",
     ]
 
     default_advanced_metrics = [
