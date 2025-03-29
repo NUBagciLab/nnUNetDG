@@ -168,7 +168,7 @@ class nnUNetTrainerV2_mixstyle(nnUNetTrainer):
         if "pretrained" in self.plans.keys():
             ### load the pretrained model
             print("Loading pretrained model from", self.plans["pretrained"])
-            self.network.load_state_dict(torch.load(self.plans["pretrained"], weights_only=True,
+            self.network.load_state_dict(torch.load(self.plans["pretrained"], 
                                                     map_location=torch.device('cpu')))
         
         if torch.cuda.is_available():

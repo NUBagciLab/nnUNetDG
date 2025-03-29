@@ -114,3 +114,4 @@ ENV/
 
 *.model
 
+custom_training.py

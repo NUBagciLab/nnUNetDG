@@ -319,7 +319,6 @@ class nnUNetTrainerV2_vrex(nnUNetTrainer):
 
         if run_online_evaluation:
             self.run_online_evaluation(total_output, target)
-        print(target.shape)
         del target
         return l.detach().cpu().numpy()
 
